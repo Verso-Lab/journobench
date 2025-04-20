@@ -229,9 +229,7 @@ def display_example_outputs(df):
 
 # --- Main App Logic ---
 st.title("JournoBench 💡")
-st.caption("AI Journalism Model Evaluation Dashboard")
-
-st.markdown("Welcome to **JournoBench**! This dashboard visualizes performance evaluations of different AI models on common journalism tasks.")
+st.caption("Welcome! Track and compare AI model performance on journalism tasks using real user feedback from Verso Playground.")
 
 with st.expander("How JournoBench Works"):
     st.markdown("""
