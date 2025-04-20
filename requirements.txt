@@ -1,0 +1,6 @@
+streamlit==1.41.1
+firebase-admin==6.3.0
+pandas==2.1.4
+matplotlib==3.8.2
+plotly==5.18.0
+google-ai-generativelanguage>=0.6.16,<0.7.0 
