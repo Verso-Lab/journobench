@@ -231,17 +231,18 @@ def display_example_outputs(df):
 st.title("JournoBench 💡")
 st.caption("AI Journalism Model Evaluation Dashboard")
 
-st.markdown("""
-Welcome to **JournoBench**! This dashboard visualizes performance evaluations of different AI models on common journalism tasks.
+st.markdown("Welcome to **JournoBench**! This dashboard visualizes performance evaluations of different AI models on common journalism tasks.")
 
-**How it works:**
-*   The data comes from the **Verso Playground** Chrome extension.
-*   Within the extension, users generate text from various AI models (like GPT-4o, Claude, Gemini) for tasks like headline writing, social copy generation, story angle brainstorming, and more.
-*   Users then evaluate the quality of these AI-generated outputs using simple up/down votes directly in their browser.
-*   This dashboard aggregates and analyzes those evaluations, allowing you to see which models perform best overall and for specific tasks based on real-world user feedback.
-
-Use the filters in the sidebar to explore the data!
-""")
+with st.expander("How JournoBench Works"):
+    st.markdown("""
+    **How it works:**
+    *   The data comes from the **Verso Playground** Chrome extension.
+    *   Within the extension, users generate text from various AI models (like GPT-4o, Claude, Gemini) for tasks like headline writing, social copy generation, story angle brainstorming, and more.
+    *   Users then evaluate the quality of these AI-generated outputs using simple up/down votes directly in their browser.
+    *   This dashboard aggregates and analyzes those evaluations, allowing you to see which models perform best overall and for specific tasks based on real-world user feedback.
+    
+    Use the filters in the sidebar to explore the data!
+    """)
 
 db = None
 try:
