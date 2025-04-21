@@ -64,7 +64,9 @@ def initialize_firestore():
 # --- Data Loading ---
 @st.cache_data(ttl="1h")
 def get_evaluation_data(_db_client): # Reverted parameter name
-    """Fetch evaluation data from Firestore, ensuring key columns exist."""
+    """Fetch evaluation data from Firestore, transform the nested structure, 
+       and ensure key columns exist.
+    """
     if not _db_client:
         st.error("Firestore client is not valid in get_evaluation_data.")
         return pd.DataFrame() # Return empty DataFrame
@@ -72,19 +74,68 @@ def get_evaluation_data(_db_client): # Reverted parameter name
     evaluations_ref = _db_client.collection("model_evaluations")
     docs = evaluations_ref.stream() 
     
-    eval_data = []
+    processed_data = [] # Renamed from eval_data for clarity
     docs_list = list(docs) 
-    for doc in docs_list:
-        data = doc.to_dict()
-        data['id'] = doc.id
-        eval_data.append(data)
     
-    if not eval_data:
-        return pd.DataFrame() # Return empty if no data fetched
+    # --- Simple Debugging: Removed --- 
+    # if eval_data: ... 
 
-    df = pd.DataFrame(eval_data)
+    for doc in docs_list:
+        parent_data = doc.to_dict()
+        doc_id = doc.id
+
+        # Extract data from parent document
+        model_id = parent_data.get('modelId')
+        task_id = parent_data.get('taskId')
+        language = parent_data.get('language')
+        eval_ts_str = parent_data.get('lastEvaluationTimestamp') # Use lastEvaluationTimestamp
+        gen_id = parent_data.get('generationId')
+
+        # Attempt to derive generationTimestamp from generationId (numeric part is ms)
+        gen_ts = pd.NaT
+        if gen_id and isinstance(gen_id, str) and '-' in gen_id:
+            try:
+                timestamp_ms_str = gen_id.split('-')[0]
+                timestamp_ms = int(timestamp_ms_str)
+                gen_ts = pd.to_datetime(timestamp_ms, unit='ms')
+            except (ValueError, IndexError):
+                gen_ts = pd.NaT # Handle cases where conversion fails
+
+        # Convert evaluation timestamp string to datetime
+        eval_ts = pd.to_datetime(eval_ts_str, errors='coerce')
+        
+        # Iterate through nested outputs
+        outputs = parent_data.get('outputs', {})
+        if isinstance(outputs, dict):
+            for output_key, output_data in outputs.items():
+                if isinstance(output_data, dict):
+                    record = {
+                        'id': f"{doc_id}_{output_key}", # Create a unique ID for each output
+                        'modelId': model_id,
+                        'taskId': task_id,
+                        'language': language,
+                        'score': output_data.get('score'),
+                        'fullOutputText': output_data.get('text'),
+                        'evaluationTimestamp': eval_ts, # Use the converted parent timestamp
+                        'generationTimestamp': gen_ts, # Use the converted timestamp
+                        # Add other parent fields if needed later, e.g.,
+                        'parent_generationId': gen_id, 
+                        'parent_doc_id': doc_id 
+                    }
+                    processed_data.append(record)
+        else:
+            # Handle cases where 'outputs' is not a dict (optional logging)
+            # print(f"DEBUG: Skipping doc {doc_id} because 'outputs' is not a dictionary: {outputs}")
+            pass 
+
+    if not processed_data:
+        return pd.DataFrame() # Return empty if no data processed
+
+    df = pd.DataFrame(processed_data)
 
     # --- Ensure essential columns exist and have correct types --- 
+    # These columns are now populated during the transformation loop,
+    # but we still check and handle types carefully.
     required_columns = {
         'taskId': 'Unknown', 
         'score': pd.NA,
@@ -97,12 +148,15 @@ def get_evaluation_data(_db_client): # Reverted parameter name
 
     for col, default_value in required_columns.items():
         if col not in df.columns:
-            df[col] = default_value
-            st.warning(f"Column '{col}' missing from Firestore data, added with default values.")
+            # This case is less likely now but good for safety
+            df[col] = default_value 
+            st.warning(f"Column '{col}' missing after transformation, added with default values.")
 
     # Convert timestamps (safe even if column was just added as NaT)
+    # Conversion now happens earlier, but we ensure dtype here
     df['evaluationTimestamp'] = pd.to_datetime(df['evaluationTimestamp'], errors='coerce')
     df['generationTimestamp'] = pd.to_datetime(df['generationTimestamp'], errors='coerce')
+    
     # Convert score (safe even if column was just added as NA)
     df['score'] = pd.to_numeric(df['score'], errors='coerce')
 
@@ -110,14 +164,14 @@ def get_evaluation_data(_db_client): # Reverted parameter name
     if pd.api.types.is_datetime64_any_dtype(df['evaluationTimestamp']):
         if df['evaluationTimestamp'].dt.tz is not None:
             df['evaluationTimestamp'] = df['evaluationTimestamp'].dt.tz_convert(None)
-    if pd.api.types.is_datetime64_any_dtype(df['generationTimestamp']):
+    if pd.api.types.is_datetime64_any_dtype(df['generationTimestamp']): 
         if df['generationTimestamp'].dt.tz is not None:
-            df['generationTimestamp'] = df['generationTimestamp'].dt.tz_convert(None)
-            
+             df['generationTimestamp'] = df['generationTimestamp'].dt.tz_convert(None)
+             
     # Add display name 
-    if 'modelId' in df.columns: # Check again as it might have been added above
+    if 'modelId' in df.columns: 
         df['modelDisplayName'] = df['modelId'].map(MODEL_DISPLAY_NAMES).fillna(df['modelId'])
-    else: # Should not happen due to check above, but for safety
+    else: 
          df['modelDisplayName'] = 'Unknown' 
          
     return df
@@ -348,7 +402,7 @@ def display_recent_evaluations(df):
 
 # --- Main App Logic ---
 st.title("JournoBench 💡")
-st.caption("Welcome! Track and compare AI model performance on journalism tasks using real user feedback from Verso Playground.")
+st.caption("Track and compare AI model performance on journalism tasks using real feedback from journalists.")
 
 with st.expander("How JournoBench Works"):
     st.markdown("""
