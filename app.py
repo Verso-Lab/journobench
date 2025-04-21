@@ -63,55 +63,92 @@ def initialize_firestore():
 
 # --- Data Loading ---
 @st.cache_data(ttl="1h")
-def get_evaluation_data(_db_client): 
-    """Fetch evaluation data from Firestore"""
+def get_evaluation_data(_db_client): # Reverted parameter name
+    """Fetch evaluation data from Firestore, ensuring key columns exist."""
     if not _db_client:
-        return [] # Return empty list if client is not valid
+        st.error("Firestore client is not valid in get_evaluation_data.")
+        return pd.DataFrame() # Return empty DataFrame
         
     evaluations_ref = _db_client.collection("model_evaluations")
-    docs = evaluations_ref.stream() # Use stream for potentially large collections
+    docs = evaluations_ref.stream() 
     
     eval_data = []
-    for doc in docs:
+    docs_list = list(docs) 
+    for doc in docs_list:
         data = doc.to_dict()
         data['id'] = doc.id
-        
-        # Safely convert timestamp
-        ts = data.get('evaluationTimestamp')
-        if ts:
-            try:
-                data['evaluationTimestamp'] = pd.to_datetime(ts)
-                if data['evaluationTimestamp'].tzinfo:
-                   data['evaluationTimestamp'] = data['evaluationTimestamp'].tz_convert(None) 
-            except Exception:
-                data['evaluationTimestamp'] = pd.NaT # Use NaT for invalid timestamps
-        else:
-             data['evaluationTimestamp'] = pd.NaT
-             
         eval_data.append(data)
     
-    # Add display name right after loading
+    if not eval_data:
+        return pd.DataFrame() # Return empty if no data fetched
+
     df = pd.DataFrame(eval_data)
-    if not df.empty and 'modelId' in df.columns:
+
+    # --- Ensure essential columns exist and have correct types --- 
+    required_columns = {
+        'taskId': 'Unknown', 
+        'score': pd.NA,
+        'evaluationTimestamp': pd.NaT,
+        'generationTimestamp': pd.NaT,
+        'modelId': 'Unknown',
+        'language': 'Unknown',
+        'fullOutputText': pd.NA
+    }
+
+    for col, default_value in required_columns.items():
+        if col not in df.columns:
+            df[col] = default_value
+            st.warning(f"Column '{col}' missing from Firestore data, added with default values.")
+
+    # Convert timestamps (safe even if column was just added as NaT)
+    df['evaluationTimestamp'] = pd.to_datetime(df['evaluationTimestamp'], errors='coerce')
+    df['generationTimestamp'] = pd.to_datetime(df['generationTimestamp'], errors='coerce')
+    # Convert score (safe even if column was just added as NA)
+    df['score'] = pd.to_numeric(df['score'], errors='coerce')
+
+    # Ensure timezone is removed if present (consistency)
+    if pd.api.types.is_datetime64_any_dtype(df['evaluationTimestamp']):
+        if df['evaluationTimestamp'].dt.tz is not None:
+            df['evaluationTimestamp'] = df['evaluationTimestamp'].dt.tz_convert(None)
+    if pd.api.types.is_datetime64_any_dtype(df['generationTimestamp']):
+        if df['generationTimestamp'].dt.tz is not None:
+            df['generationTimestamp'] = df['generationTimestamp'].dt.tz_convert(None)
+            
+    # Add display name 
+    if 'modelId' in df.columns: # Check again as it might have been added above
         df['modelDisplayName'] = df['modelId'].map(MODEL_DISPLAY_NAMES).fillna(df['modelId'])
-    elif not df.empty:
-         df['modelDisplayName'] = 'Unknown' # Handle case where modelId column might be missing
+    else: # Should not happen due to check above, but for safety
+         df['modelDisplayName'] = 'Unknown' 
          
-    return df # Return DataFrame directly
+    return df
 
 # --- UI Display Functions ---
 def display_stats(df):
     """Displays key evaluation statistics in columns."""
     st.header("📊 Evaluation Statistics")
-    col1, col2, col3 = st.columns(3)
+
+    # Calculate metrics
+    num_total_generations = len(df)
+    evaluated_df = df.dropna(subset=['score'])
+    num_evaluated = len(evaluated_df)
+    
+    # Calculate evaluation rate, handle division by zero
+    evaluation_rate = (num_evaluated / num_total_generations * 100) if num_total_generations > 0 else 0
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
     with col1:
-        st.metric("Total Evaluations", len(df))
+        st.metric("Total Generations", num_total_generations)
     with col2:
-        avg_score = df['score'].mean()
-        st.metric("Average Score", f"{avg_score:.2f}" if pd.notna(avg_score) else "N/A")
+        st.metric("Evaluated Entries", num_evaluated)
     with col3:
-        if len(df) > 0:
-             positive_percentage = (df['score'] > 0).sum() / len(df) * 100
+        st.metric("Evaluation Rate", f"{evaluation_rate:.1f}%")
+    with col4:
+        avg_score = evaluated_df['score'].mean() # Mean ignores NaN
+        st.metric("Average Score", f"{avg_score:.2f}" if pd.notna(avg_score) else "N/A")
+    with col5:
+        if num_evaluated > 0:
+             positive_percentage = (evaluated_df['score'] > 0).sum() / num_evaluated * 100
              st.metric("Positive Ratings %", f"{positive_percentage:.1f}%" if pd.notna(positive_percentage) else "N/A")
         else:
              st.metric("Positive Ratings %", "N/A")
@@ -119,10 +156,18 @@ def display_stats(df):
 def display_performance_chart(df, selected_task):
     """Displays the main model performance bar chart using display names."""
     st.header("🏆 Model Performance Ranking")
-    # Group by display name now
-    model_stats = df.groupby('modelDisplayName').agg(
+
+    # Filter out rows without a score before grouping for chart metrics
+    evaluated_df = df.dropna(subset=['score'])
+
+    if evaluated_df.empty:
+        st.warning("No evaluated data available for the selected filters to display performance chart.")
+        return
+
+    # Group by display name now, using the evaluated data
+    model_stats = evaluated_df.groupby('modelDisplayName').agg(
         Average_Score=('score', 'mean'),
-        Total_Evaluations=('id', 'count')
+        Evaluated_Count=('score', 'count') # Count only entries with a score
     ).reset_index().sort_values('Average_Score', ascending=False)
     
     fig = px.bar(
@@ -130,102 +175,176 @@ def display_performance_chart(df, selected_task):
         x='modelDisplayName', # Use display name for x-axis
         y='Average_Score',
         color='Average_Score',
-        labels={'modelDisplayName': 'Model', 'Average_Score': 'Average Score'}, # Update label
+        labels={'modelDisplayName': 'Model', 'Average_Score': 'Average Score', 'Evaluated_Count': 'Evaluated Count'}, # Update label
         title=f"Model Average Score Comparison{' for Task: ' + selected_task if selected_task != 'All Tasks' else ''}",
-        hover_data=['Total_Evaluations'],
+        hover_data=['Evaluated_Count'], # Update hover data key
         color_continuous_scale='RdYlGn' 
     )
     fig.update_layout(xaxis_title="Model", yaxis_title="Average Score")
     st.plotly_chart(fig, use_container_width=True)
 
 def display_performance_details(df):
-    """Displays the detailed model performance table using display names."""
+    """Displays the detailed model performance table with expanded metrics."""
     with st.expander("🔍 View Detailed Model Performance Data"):
-        # Group by display name
-        model_stats = df.groupby('modelDisplayName').agg(
+        
+        if df.empty:
+            st.warning("No data available for the selected filters to display performance details.")
+            return
+
+        # 1. Calculate Total Generations per model (from original df)
+        total_gens = df.groupby('modelDisplayName').size().reset_index(name='Total_Generations')
+
+        # 2. Filter evaluated data
+        evaluated_df = df.dropna(subset=['score'])
+
+        if evaluated_df.empty:
+            st.info("No evaluated entries for the selected filters. Displaying total generations only.")
+            # Display only total generations if no evaluations exist for the filter
+            total_gens = total_gens.rename(columns={'modelDisplayName': 'Model', 'Total_Generations': 'Total Generations'})
+            st.dataframe(total_gens, use_container_width=True, hide_index=True)
+            return
+
+        # 3. Calculate Aggregated Stats from evaluated data
+        evaluated_stats = evaluated_df.groupby('modelDisplayName').agg(
             Average_Score=('score', 'mean'),
-            Total_Evaluations=('id', 'count')
+            Evaluated_Count=('score', 'count')
         ).reset_index()
-        
-        # Need original ID temporarily for positive count calculation if display name isn't unique (it should be here)
-        # Let's assume display name is unique enough for grouping positive counts too
-        model_positive = df[df['score'] > 0].groupby('modelDisplayName').size().reset_index(name='Positive_Count')
-        model_details = model_stats.merge(model_positive, on='modelDisplayName', how='left').fillna(0)
-        
-        model_details['Positive_Percentage'] = (
-            (model_details['Positive_Count'] / model_details['Total_Evaluations'] * 100)
-            .replace([float('inf'), -float('inf')], 0) 
-            .fillna(0)
+
+        # 4. Calculate Upvotes and Downvotes
+        upvotes = evaluated_df[evaluated_df['score'] > 0].groupby('modelDisplayName').size().reset_index(name='Upvotes')
+        downvotes = evaluated_df[evaluated_df['score'] < 0].groupby('modelDisplayName').size().reset_index(name='Downvotes')
+
+        # 5. Merge all metrics together
+        # Start with total generations, then merge evaluated stats
+        model_details = total_gens.merge(evaluated_stats, on='modelDisplayName', how='left')
+        # Merge upvotes and downvotes
+        model_details = model_details.merge(upvotes, on='modelDisplayName', how='left')
+        model_details = model_details.merge(downvotes, on='modelDisplayName', how='left')
+
+        # Fill NaN values resulting from merges (e.g., model with generations but no evaluations, or evaluations but no up/downvotes)
+        model_details.fillna({
+            'Average_Score': pd.NA, # Keep NA for score if no evaluations
+            'Evaluated_Count': 0,
+            'Upvotes': 0,
+            'Downvotes': 0
+        }, inplace=True)
+
+        # Convert counts to integers
+        for col in ['Total_Generations', 'Evaluated_Count', 'Upvotes', 'Downvotes']:
+            model_details[col] = model_details[col].astype(int)
+
+        # 6. Calculate Rates/Percentages (handle division by zero)
+        model_details['Evaluation_Rate'] = (
+            (model_details['Evaluated_Count'] / model_details['Total_Generations'] * 100)
+            if model_details['Total_Generations'].gt(0).all() else 0 
+        )
+        model_details['Upvote_Percentage'] = (
+            (model_details['Upvotes'] / model_details['Evaluated_Count'] * 100)
+             if model_details['Evaluated_Count'].gt(0).all() else 0
+        )
+        model_details['Downvote_Percentage'] = (
+             (model_details['Downvotes'] / model_details['Evaluated_Count'] * 100)
+             if model_details['Evaluated_Count'].gt(0).all() else 0
         )
         
-        model_details['Positive_Percentage'] = model_details['Positive_Percentage'].round(1).astype(str) + '%'
-        model_details['Average_Score'] = model_details['Average_Score'].round(2)
-        
-        st.dataframe(
-            model_details[['modelDisplayName', 'Average_Score', 'Total_Evaluations', 'Positive_Percentage']]
-            .sort_values("Average_Score", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-             column_config={"modelDisplayName": "Model"} # Set column header
+        # Handle potential division by zero on a per-row basis if the .all() check isn't sufficient (e.g., mixed 0s)
+        model_details['Evaluation_Rate'] = model_details.apply(
+            lambda row: (row['Evaluated_Count'] / row['Total_Generations'] * 100) if row['Total_Generations'] > 0 else 0, axis=1
+        )
+        model_details['Upvote_Percentage'] = model_details.apply(
+            lambda row: (row['Upvotes'] / row['Evaluated_Count'] * 100) if row['Evaluated_Count'] > 0 else 0, axis=1
+        )
+        model_details['Downvote_Percentage'] = model_details.apply(
+            lambda row: (row['Downvotes'] / row['Evaluated_Count'] * 100) if row['Evaluated_Count'] > 0 else 0, axis=1
         )
 
-def display_recent_evaluations(df):
-    """Displays the table of recent evaluations using display names."""
-    with st.expander("📄 View Recent Evaluation Entries"):
-        if 'evaluationTimestamp' in df.columns:
-            recent_evals = df.sort_values('evaluationTimestamp', ascending=False)
-        else: 
-            recent_evals = df 
-            
-        # Include modelDisplayName, remove modelId
-        display_cols = [col for col in ['evaluationTimestamp', 'modelDisplayName', 'task', 'score', 'outputSnippet'] if col in recent_evals.columns]
-        
+        # 7. Format for display
+        model_details['Evaluation_Rate'] = model_details['Evaluation_Rate'].round(1).astype(str) + '%'
+        model_details['Upvote_Percentage'] = model_details['Upvote_Percentage'].round(1).astype(str) + '%'
+        model_details['Downvote_Percentage'] = model_details['Downvote_Percentage'].round(1).astype(str) + '%'
+        model_details['Average_Score'] = model_details['Average_Score'].round(2) # Keep as number for sorting, display handles format
+
+        # 8. Select, Rename, and Sort columns for display
+        display_columns = [
+            'modelDisplayName',
+            'Total_Generations',
+            'Evaluated_Count',
+            'Evaluation_Rate',
+            'Upvotes',
+            'Downvotes',
+            'Upvote_Percentage',
+            'Downvote_Percentage',
+            'Average_Score'
+        ]
+        model_details_display = model_details[display_columns].rename(columns={
+            'modelDisplayName': 'Model',
+            'Total_Generations': 'Total Gens',
+            'Evaluated_Count': 'Evaluated',
+            'Evaluation_Rate': 'Eval Rate %',
+            'Upvotes': '👍', 
+            'Downvotes': '👎',
+            'Upvote_Percentage': 'Upvote %',
+            'Downvote_Percentage': 'Downvote %',
+            'Average_Score': 'Avg Score'
+        })
+
+        # Sort by Average Score (descending), handle potential NAs in sorting
+        model_details_display = model_details_display.sort_values("Avg Score", ascending=False, na_position='last')
+
         st.dataframe(
-            recent_evals[display_cols].head(20), 
+            model_details_display,
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "evaluationTimestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm"),
-                "score": st.column_config.NumberColumn("Score", format="%d"),
-                "modelDisplayName": "Model" # Set column header
+             column_config={ # Optional: Refine formatting if needed
+                "Avg Score": st.column_config.NumberColumn(format="%.2f"),
             }
         )
 
-def display_example_outputs(df):
-    """Displays one positive and one negative example output using display names."""
-    st.header("📝 Example Outputs")
-    
-    if 'evaluationTimestamp' in df.columns:
-         df = df.sort_values('evaluationTimestamp', ascending=False)
+def display_recent_evaluations(df):
+    """Displays the table of recent evaluations using display names, sorted by generation time."""
+    with st.expander("📄 View Recent Entries (Sorted by Generation Time)"):
+        # Ensure necessary timestamp columns exist
+        if 'generationTimestamp' not in df.columns:
+            st.warning("Generation timestamp column missing. Cannot display recent entries.")
+            return
             
-    positive_examples = df[df['score'] > 0]
-    negative_examples = df[df['score'] < 0]
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("👍 Positive Example")
-        if not positive_examples.empty:
-            example = positive_examples.iloc[0]
-            # Use modelDisplayName
-            for field in ['modelDisplayName', 'task', 'inputHeadline', 'outputSnippet']:
-                 if field in example and pd.notna(example[field]):
-                      display_field = field.replace('modelDisplayName', 'Model').replace('input','Input ').replace('output','Output ').capitalize()
-                      st.markdown(f"**{display_field}:** {example[field]}")
-        else:
-            st.info("No positive examples match the current filters.")
+        # Sort by generation timestamp (most recent first)
+        recent_evals = df.sort_values('generationTimestamp', ascending=False)
 
-    with col2:
-        st.subheader("👎 Negative Example")
-        if not negative_examples.empty:
-            example = negative_examples.iloc[0]
-            # Use modelDisplayName
-            for field in ['modelDisplayName', 'task', 'inputHeadline', 'outputSnippet']:
-                 if field in example and pd.notna(example[field]):
-                      display_field = field.replace('modelDisplayName', 'Model').replace('input','Input ').replace('output','Output ').capitalize()
-                      st.markdown(f"**{display_field}:** {example[field]}")
+        # Prepare display dataframe
+        display_df = recent_evals.copy()
+        
+        # Handle potential NaN scores for display
+        if 'score' in display_df.columns:
+            display_df['score_display'] = display_df['score'].apply(lambda x: f"{int(x)}" if pd.notna(x) else "N/A")
         else:
-             st.info("No negative examples match the current filters.")
+            display_df['score_display'] = "N/A"
+
+        # Select and order columns for display
+        display_cols_ordered = [
+            'generationTimestamp', 
+            'modelDisplayName', 
+            'taskId', 
+            'score_display', # Use the display-formatted score
+            'fullOutputText', # Use correct column name
+            'evaluationTimestamp' # Keep evaluation timestamp as well
+        ]
+        # Filter to only columns that actually exist in the dataframe
+        display_cols_existing = [col for col in display_cols_ordered if col in display_df.columns]
+        
+        st.dataframe(
+            display_df[display_cols_existing].head(20), 
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "generationTimestamp": st.column_config.DatetimeColumn("Generated", format="YYYY-MM-DD HH:mm"),
+                "evaluationTimestamp": st.column_config.DatetimeColumn("Evaluated", format="YYYY-MM-DD HH:mm"),
+                "score_display": st.column_config.TextColumn("Score"), # Display score as text
+                "modelDisplayName": "Model",
+                "taskId": "Task ID", 
+                "fullOutputText": "Generated Text" # Use correct column name and update label
+            }
+        )
 
 # --- Main App Logic ---
 st.title("JournoBench 💡")
@@ -268,7 +387,15 @@ if df.empty:
     st.stop()
 
 # --- Filter Setup ---
-all_tasks = ["All Tasks"] + sorted(df['task'].astype(str).unique().tolist())
+# Use taskId for generating task filter options
+all_tasks = ["All Tasks"] 
+if 'taskId' in df.columns:
+    all_tasks += sorted(df['taskId'].astype(str).unique().tolist())
+else:
+    st.warning("'taskId' column not found. Cannot create task filter.")
+    # Optionally add a default 'Unknown' task if appropriate for your logic
+    # all_tasks += ['Unknown'] 
+
 model_display_name_options = ["All Models"] + sorted(df['modelDisplayName'].unique().tolist())
 
 # Add language filter options
@@ -298,19 +425,38 @@ selected_language = st.sidebar.selectbox("🌐 Select Language", all_languages)
 # --- Apply Filters ---
 filtered_df = df.copy()
 
+# Date Filtering: Apply the filter only to rows that HAVE an evaluationTimestamp.
+# This ensures that rows without an evaluationTimestamp (i.e., unevaluated entries)
+# are NOT dropped by the date filter itself.
 if start_date and end_date and 'evaluationTimestamp' in filtered_df.columns:
      start_datetime = pd.to_datetime(start_date)
      end_datetime = pd.to_datetime(end_date) + pd.Timedelta(days=1)
-     # Ensure timestamp column is datetime before filtering
+     
+     # Ensure timestamp column is datetime 
+     # Note: Applying this conversion repeatedly might be slightly inefficient 
+     # but is safe. Could optimize by doing it once after loading if needed.
      filtered_df['evaluationTimestamp'] = pd.to_datetime(filtered_df['evaluationTimestamp'], errors='coerce')
-     filtered_df = filtered_df.dropna(subset=['evaluationTimestamp']) # Remove rows where conversion failed
-     filtered_df = filtered_df[
+
+     # Condition 1: Rows that DO NOT have an evaluation timestamp (NaT).
+     # These rows should always be kept regardless of the date range selected.
+     no_timestamp_cond = filtered_df['evaluationTimestamp'].isna()
+     
+     # Condition 2: Rows that DO have an evaluation timestamp AND fall within the selected date range.
+     has_timestamp_and_in_range_cond = (
+         filtered_df['evaluationTimestamp'].notna() & 
          (filtered_df['evaluationTimestamp'] >= start_datetime) & 
          (filtered_df['evaluationTimestamp'] < end_datetime)
-     ]
+     )
 
-if selected_task != "All Tasks":
-    filtered_df = filtered_df[filtered_df['task'] == selected_task]
+     # Keep rows that satisfy EITHER condition 1 OR condition 2
+     filtered_df = filtered_df[no_timestamp_cond | has_timestamp_and_in_range_cond]
+
+# Use taskId for filtering
+if selected_task != "All Tasks": 
+    if 'taskId' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['taskId'] == selected_task]
+    else:
+        st.warning("Cannot filter by task: 'taskId' column not found in data.")
 
 if selected_model_display_name != "All Models":
     filtered_df = filtered_df[filtered_df['modelDisplayName'] == selected_model_display_name]
@@ -331,8 +477,6 @@ else:
         st.divider()
         display_performance_details(filtered_df)
         display_recent_evaluations(filtered_df)
-        st.divider()
-        display_example_outputs(filtered_df)
     except Exception as display_error:
          st.error("🚨 An error occurred while displaying the results.")
          st.error(f"Error details: {display_error}")
