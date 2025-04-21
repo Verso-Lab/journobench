@@ -538,4 +538,4 @@ else:
 
 # Simple Footer
 st.markdown("--- ")
-st.caption("JournoBench | Built with Streamlit") 
+st.caption("JournoBench | Built by Verso") 
