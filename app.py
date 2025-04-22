@@ -23,7 +23,14 @@ MODEL_DISPLAY_NAMES = {
     "gemini-2.5-flash-preview-04-17": "Google Gemini Flash 2.5 Preview",
     "gemini-2.5-pro-preview-03-25": "Google Gemini Pro 2.5 Preview (R)",
     "gpt-4o": "OpenAI GPT-4o",
-    "o4-mini-2025-04-16": "OpenAI o4-mini (R)"
+    "o4-mini-2025-04-16": "OpenAI o4-mini (R)",
+    "gpt-4.1": "OpenAI GPT-4.1"
+}
+
+# Add language display names
+LANGUAGE_DISPLAY_NAMES = {
+    "en": "English",
+    "de": "Deutsch"
 }
 
 # --- Firestore Initialization ---
@@ -62,63 +69,55 @@ def initialize_firestore():
     return firestore.client()
 
 # --- Data Loading ---
-@st.cache_data(ttl="1h")
+@st.cache_data(ttl="1h") # Restore caching
 def get_evaluation_data(_db_client): # Reverted parameter name
     """Fetch evaluation data from Firestore, transform the nested structure, 
-       and ensure key columns exist.
+       and ensure key columns exist. Now fetches from generation_logs.
     """
     if not _db_client:
         st.error("Firestore client is not valid in get_evaluation_data.")
         return pd.DataFrame() # Return empty DataFrame
         
-    evaluations_ref = _db_client.collection("model_evaluations")
+    evaluations_ref = _db_client.collection("generation_logs") 
     docs = evaluations_ref.stream() 
     
-    processed_data = [] # Renamed from eval_data for clarity
+    processed_data = [] 
     docs_list = list(docs) 
-    
-    # --- Simple Debugging: Removed --- 
-    # if eval_data: ... 
 
     for doc in docs_list:
         parent_data = doc.to_dict()
         doc_id = doc.id
 
-        # Extract data from parent document
+        # --- Updated Extraction Logic --- 
         model_id = parent_data.get('modelId')
-        task_id = parent_data.get('taskId')
+        task_id = parent_data.get('task') # Use 'task' field
         language = parent_data.get('language')
-        eval_ts_str = parent_data.get('lastEvaluationTimestamp') # Use lastEvaluationTimestamp
+        
+        # Get evaluation timestamp from nested structure
+        eval_data = parent_data.get('evaluation', {}) # Get evaluation dict, default to empty
+        eval_ts = pd.to_datetime(eval_data.get('lastEvaluationTimestamp'), errors='coerce')
+
+        # Get generation timestamp directly
+        gen_ts = pd.to_datetime(parent_data.get('timestamp'), errors='coerce')
+
+        # Get parent generation ID
         gen_id = parent_data.get('generationId')
-
-        # Attempt to derive generationTimestamp from generationId (numeric part is ms)
-        gen_ts = pd.NaT
-        if gen_id and isinstance(gen_id, str) and '-' in gen_id:
-            try:
-                timestamp_ms_str = gen_id.split('-')[0]
-                timestamp_ms = int(timestamp_ms_str)
-                gen_ts = pd.to_datetime(timestamp_ms, unit='ms')
-            except (ValueError, IndexError):
-                gen_ts = pd.NaT # Handle cases where conversion fails
-
-        # Convert evaluation timestamp string to datetime
-        eval_ts = pd.to_datetime(eval_ts_str, errors='coerce')
+        # --- End Updated Extraction Logic ---
         
         # Iterate through nested outputs
-        outputs = parent_data.get('outputs', {})
+        outputs = parent_data.get('outputs', {}) 
         if isinstance(outputs, dict):
             for output_key, output_data in outputs.items():
                 if isinstance(output_data, dict):
                     record = {
-                        'id': f"{doc_id}_{output_key}", # Create a unique ID for each output
+                        'id': f"{doc_id}_{output_key}",
                         'modelId': model_id,
-                        'taskId': task_id,
-                        'language': language,
-                        'score': output_data.get('score'),
-                        'fullOutputText': output_data.get('text'),
-                        'evaluationTimestamp': eval_ts, # Use the converted parent timestamp
-                        'generationTimestamp': gen_ts, # Use the converted timestamp
-                        # Add other parent fields if needed later, e.g.,
+                        'taskId': task_id, # Use extracted task_id
+                        'language': language, # Use extracted language
+                        'score': output_data.get('score'), # Score is inside output_data
+                        'fullOutputText': output_data.get('text'), # Text is inside output_data
+                        'evaluationTimestamp': eval_ts, # Use extracted eval_ts
+                        'generationTimestamp': gen_ts, # Use extracted gen_ts
                         'parent_generationId': gen_id, 
                         'parent_doc_id': doc_id 
                     }
@@ -452,10 +451,15 @@ else:
 
 model_display_name_options = ["All Models"] + sorted(df['modelDisplayName'].unique().tolist())
 
-# Add language filter options
+# Add language filter options using display names
 all_languages = ["All Languages"] 
 if 'language' in df.columns:
-    all_languages += sorted(df['language'].astype(str).unique().tolist())
+    unique_languages = df['language'].astype(str).unique().tolist()
+    # Map codes to display names, keeping original code if no mapping exists
+    language_display_options = sorted([
+        LANGUAGE_DISPLAY_NAMES.get(lang, lang) for lang in unique_languages
+    ])
+    all_languages += language_display_options
 
 min_date, max_date, start_date, end_date = None, None, None, None
 if 'evaluationTimestamp' in df.columns and not df['evaluationTimestamp'].isnull().all():
@@ -517,7 +521,13 @@ if selected_model_display_name != "All Models":
 
 # Apply language filter
 if selected_language != "All Languages" and 'language' in filtered_df.columns:
-    filtered_df = filtered_df[filtered_df['language'] == selected_language]
+    # Find the language code corresponding to the selected display name
+    lang_code_to_filter = selected_language # Default to selected value if no match found
+    for code, display_name in LANGUAGE_DISPLAY_NAMES.items():
+        if display_name == selected_language:
+            lang_code_to_filter = code
+            break # Found the code, exit the loop
+    filtered_df = filtered_df[filtered_df['language'] == lang_code_to_filter]
 
 # --- Display Content ---
 if filtered_df.empty:
