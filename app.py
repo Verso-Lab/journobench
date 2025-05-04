@@ -20,7 +20,7 @@ st.set_page_config(
 # --- Constants ---
 MODEL_DISPLAY_NAMES = {
     "claude-3-7-sonnet-20250219": "Anthropic Claude Sonnet 3.7",
-    "claude-3-5-sonnet-20240620": "Anthropic Claude Sonnet 3.5",
+    "claude-3-5-sonnet-20241022": "Anthropic Claude Sonnet 3.5",
     "gemini-2.5-flash-preview-04-17": "Google Gemini Flash 2.5 Preview",
     "gemini-2.5-pro-preview-03-25": "Google Gemini Pro 2.5 Preview (R)",
     "gpt-4o": "OpenAI GPT-4o",
